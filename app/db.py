@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,3 +111,34 @@ def init_db(path: str | os.PathLike[str]) -> None:
         conn.executescript(SCHEMA)
     finally:
         conn.close()
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection):
+    """Pin every read inside the block to one committed database snapshot.
+
+    In WAL mode a plain (deferred) ``BEGIN`` takes a read mark on the first
+    statement and then sees the same snapshot for the whole transaction.  All
+    SELECTs issued by a GET endpoint therefore observe holdings, candidate
+    groups and batch audit rows from the *same* commit point: a batch that
+    commits mid-request can no longer splice pre-commit copies onto
+    post-commit candidate groups.
+
+    Readers take no write lock, so a concurrent ``BEGIN IMMEDIATE`` batch is
+    neither blocked nor able to change the snapshot once it is taken.  The
+    context manager is re-entrant: nested calls reuse the surrounding
+    transaction instead of issuing a second ``BEGIN`` (which SQLite rejects).
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        # Deferred transaction: the snapshot is established by the first read.
+        conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    else:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("COMMIT")

@@ -82,8 +82,14 @@ def create_volume(payload: VolumeCreate, conn: Conn):
 
 @app.get("/volumes/{volume_id}", tags=["volumes"])
 def read_volume(volume_id: int, conn: Conn):
-    """Show the manifest, current copies and the live gap report."""
-    return service.volume_snapshot(service.get_volume_state(conn, volume_id))
+    """Show the manifest, current copies and the live gap report.
+
+    Every part of the response (manifest, copies, candidate groups and the
+    gap classification) is read inside one snapshot transaction, so it always
+    reflects a single committed point in time.
+    """
+    with db.read_snapshot(conn):
+        return service.volume_snapshot(service.get_volume_state(conn, volume_id))
 
 
 @app.get("/volumes/{volume_id}/gaps", tags=["reconciliation"])

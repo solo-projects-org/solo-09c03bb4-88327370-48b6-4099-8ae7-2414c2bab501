@@ -79,6 +79,37 @@ def _fetch_issue_labels(conn: sqlite3.Connection, volume_id: int) -> list[str]:
     return [r["label"] for r in rows]
 
 
+def _fetch_copy_groups(
+    conn: sqlite3.Connection, copy_ids: list[int]
+) -> dict[int, list[int]]:
+    """Candidate-group issue bitmasks for the given copies, keyed by copy id."""
+    if not copy_ids:
+        return {}
+    placeholders = ",".join("?" * len(copy_ids))
+    group_rows = conn.execute(
+        f"""
+        SELECT g.id, g.copy_id, g.position, gi.issue_id, i.position AS issue_position
+        FROM candidate_groups g
+        LEFT JOIN candidate_group_issues gi ON gi.group_id = g.id
+        LEFT JOIN issues i ON i.id = gi.issue_id
+        WHERE g.copy_id IN ({placeholders})
+        ORDER BY g.copy_id, g.position, i.position
+        """,
+        copy_ids,
+    ).fetchall()
+    groups: dict[int, dict[int, int]] = {}
+    for row in group_rows:
+        per_copy = groups.setdefault(row["copy_id"], {})
+        mask = per_copy.get(row["position"], 0)
+        if row["issue_position"] is not None:
+            mask |= 1 << (row["issue_position"] - 1)
+        per_copy[row["position"]] = mask
+    return {
+        copy_id: [per_group[pos] for pos in sorted(per_group)]
+        for copy_id, per_group in groups.items()
+    }
+
+
 def _fetch_copies(conn: sqlite3.Connection, volume_id: int) -> list[CopyState]:
     copy_rows = conn.execute(
         "SELECT id, barcode FROM copies WHERE volume_id = ? ORDER BY id",
@@ -91,30 +122,11 @@ def _fetch_copies(conn: sqlite3.Connection, volume_id: int) -> list[CopyState]:
         order.append(row["id"])
     if not order:
         return []
-    placeholders = ",".join("?" * len(order))
-    group_rows = conn.execute(
-        f"""
-        SELECT g.id, g.copy_id, g.position, gi.issue_id, i.position AS issue_position
-        FROM candidate_groups g
-        LEFT JOIN candidate_group_issues gi ON gi.group_id = g.id
-        LEFT JOIN issues i ON i.id = gi.issue_id
-        WHERE g.copy_id IN ({placeholders})
-        ORDER BY g.copy_id, g.position, i.position
-        """,
-        order,
-    ).fetchall()
-    groups: dict[int, dict[int, int]] = {}
-    for row in group_rows:
-        per_copy = groups.setdefault(row["copy_id"], {})
-        mask = per_copy.get(row["position"], 0)
-        if row["issue_position"] is not None:
-            mask |= 1 << (row["issue_position"] - 1)
-        per_copy[row["position"]] = mask
-    copies: list[CopyState] = []
-    for copy_id in order:
-        masks = [groups[copy_id][pos] for pos in sorted(groups.get(copy_id, {}))]
-        copies.append(CopyState(by_id[copy_id].barcode, masks))
-    return copies
+    groups = _fetch_copy_groups(conn, order)
+    return [
+        CopyState(by_id[copy_id].barcode, groups.get(copy_id, []))
+        for copy_id in order
+    ]
 
 
 def get_volume_state(conn: sqlite3.Connection, volume_id: int) -> VolumeState:
@@ -183,18 +195,21 @@ def volume_snapshot(volume: VolumeState) -> dict:
 
 
 def gap_report(conn: sqlite3.Connection, volume_id: int) -> dict:
-    volume = get_volume_state(conn, volume_id)
-    evaluation = reconcile(volume)
-    if not evaluation.satisfiable:
-        raise ApiError(
-            500,
-            "holdings_inconsistent",
-            "persisted holdings are not reconcilable; database was modified externally",
-        )
-    report = _describe(evaluation, volume)
-    report["volume_id"] = volume.id
-    report["issues"] = volume.issue_labels
-    return report
+    # One snapshot for the manifest, every copy and every candidate group, so
+    # the classification can never mix two committed states.
+    with db.read_snapshot(conn):
+        volume = get_volume_state(conn, volume_id)
+        evaluation = reconcile(volume)
+        if not evaluation.satisfiable:
+            raise ApiError(
+                500,
+                "holdings_inconsistent",
+                "persisted holdings are not reconcilable; database was modified externally",
+            )
+        report = _describe(evaluation, volume)
+        report["volume_id"] = volume.id
+        report["issues"] = volume.issue_labels
+        return report
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +264,8 @@ def create_volume(
     except BaseException:
         conn.execute("ROLLBACK")
         raise
-    return volume_snapshot(get_volume_state(conn, volume_id))
+    with db.read_snapshot(conn):
+        return volume_snapshot(get_volume_state(conn, volume_id))
 
 
 # ---------------------------------------------------------------------------
@@ -470,16 +486,18 @@ def _load_batch(conn: sqlite3.Connection, volume_id: int, batch_id: int) -> dict
 
 
 def list_batches(conn: sqlite3.Connection, volume_id: int) -> list[dict]:
-    get_volume_state(conn, volume_id)  # 404 if missing
-    rows = conn.execute(
-        "SELECT id FROM batches WHERE volume_id = ? ORDER BY seq", (volume_id,)
-    ).fetchall()
-    return [_load_batch(conn, volume_id, row["id"]) for row in rows]
+    with db.read_snapshot(conn):
+        get_volume_state(conn, volume_id)  # 404 if missing
+        rows = conn.execute(
+            "SELECT id FROM batches WHERE volume_id = ? ORDER BY seq", (volume_id,)
+        ).fetchall()
+        return [_load_batch(conn, volume_id, row["id"]) for row in rows]
 
 
 def get_batch(conn: sqlite3.Connection, volume_id: int, batch_id: int) -> dict:
-    get_volume_state(conn, volume_id)
-    return _load_batch(conn, volume_id, batch_id)
+    with db.read_snapshot(conn):
+        get_volume_state(conn, volume_id)
+        return _load_batch(conn, volume_id, batch_id)
 
 
 def _store_rejected(

@@ -14,7 +14,9 @@ It walks through:
   4. committing that batch,
   5. submitting a conflicting batch that is rejected in full while both the
      holdings and the gap conclusion remain queryable,
-  6. concurrent submissions where the loser is evaluated after the winner.
+  6. concurrent submissions where the loser is evaluated after the winner,
+  7. interleaved GET /volumes/{id} and /gaps reads while a correction batch
+     commits: every response is one whole committed state, never a splice.
 """
 
 from __future__ import annotations
@@ -183,6 +185,82 @@ def main() -> int:
         for barcode, body in sorted(results):
             print(f"  {barcode}: {body.get('status')}")
         print(f"  提交顺序(seq): {[(b['seq'], b['status']) for b in call('GET', f'/volumes/{vid}/batches')[1]]}")
+
+    # Interleaved reads vs a correction batch.  Each GET is served inside one
+    # snapshot transaction (manifest + copies + candidate groups + gap report
+    # at the same commit point), so every response must match either the
+    # pre-commit state or the post-commit state as a whole.
+    volume3 = call(
+        "POST",
+        "/volumes",
+        {"title": "旧期刊演示", "volume_label": "第14卷", "issues": ["第1期", "第2期", "第3期"]},
+    )
+    if volume3[0] == 201:
+        vid3 = volume3[1]["volume_id"]
+        assert call(
+            "POST",
+            f"/volumes/{vid3}/batches",
+            {"items": [{"barcode": "D-1", "action": "add", "candidates": [["第1期"]]}]},
+        )[0] == 201
+        pre = call("GET", f"/volumes/{vid3}")[1]
+        pre_signature = (
+            tuple(c["barcode"] for c in pre["copies"]),
+            tuple(pre["gap_report"]["held"]),
+        )
+
+        barrier = threading.Barrier(2)
+        observations: list[tuple[str, tuple, tuple]] = []
+        obs_lock = threading.Lock()
+
+        def reader() -> None:
+            barrier.wait()
+            for _ in range(6):
+                snap_status, snap = call("GET", f"/volumes/{vid3}")
+                gap_status, gaps = call("GET", f"/volumes/{vid3}/gaps")
+                assert snap_status == 200 and gap_status == 200
+                # Internal consistency: the embedded report equals /gaps
+                # inputs at the same logical point and partitions the manifest.
+                assert snap["gap_report"]["summary"] == gaps["summary"]
+                signature = (
+                    tuple(c["barcode"] for c in snap["copies"]),
+                    tuple(gaps["held"]),
+                )
+                with obs_lock:
+                    observations.append(("snapshot+gaps",) + signature)
+
+        def corrector() -> None:
+            barrier.wait()
+            status, body = call(
+                "POST",
+                f"/volumes/{vid3}/batches",
+                {
+                    "items": [
+                        {"barcode": "D-1", "action": "update", "candidates": [["第2期"]]},
+                        {"barcode": "D-2", "action": "add", "candidates": [["第3期"]]},
+                    ]
+                },
+            )
+            assert status == 201 and body["status"] == "committed", (status, body)
+
+        threads = [threading.Thread(target=reader), threading.Thread(target=corrector)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        post = call("GET", f"/volumes/{vid3}")[1]
+        post_signature = (
+            tuple(c["barcode"] for c in post["copies"]),
+            tuple(post["gap_report"]["held"]),
+        )
+        print("\n== 读取与更正交错：每个响应都是完整的同一时点 ==")
+        print(f"  更正前状态: {pre_signature}")
+        print(f"  更正后状态: {post_signature}")
+        seen = sorted(set(obs[1:] for obs in observations))
+        print(f"  交错期间实际观测到的状态: {seen}")
+        assert set(seen) <= {pre_signature, post_signature}, "observed a spliced state!"
+        assert pre_signature != post_signature
+        print("  所有 GET /volumes/{id} 与 /gaps 均只落在更正前或更正后的完整状态上")
 
     print("\nSwagger UI: " + BASE + "/docs")
     return 0
