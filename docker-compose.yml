@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: periodical-gaps:latest
+    container_name: periodical-gaps
+    ports:
+      - "8000:8000"
+    environment:
+      PERIODICALS_DB: /data/periodicals.sqlite3
+    volumes:
+      - periodical-data:/data
+    restart: unless-stopped
+
+volumes:
+  periodical-data:
